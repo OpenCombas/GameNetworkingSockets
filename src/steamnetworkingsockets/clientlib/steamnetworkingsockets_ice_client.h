@@ -117,6 +117,16 @@ namespace SteamNetworkingSocketsLib {
         // new CreatePermission sweep is needed.
         int m_nTURNPermissionRevision = 0;
 
+        // When to re-send CreatePermission to keep our TURN permissions alive.
+        // TURN permissions have a FIXED 300s lifetime (RFC 5766 section 8) and are NOT
+        // refreshed by relayed data -- only by another CreatePermission.  Without this
+        // timer, a stable session (no new peer IP to bump the revision) lets every
+        // permission expire after 5 minutes, at which point the relay silently stops
+        // forwarding peer->us traffic and all relay-dependent peers drop at once.  Set to
+        // now + k_usecTURNPermissionRefreshInterval on each successful CreatePermission;
+        // zero means no active allocation.
+        SteamNetworkingMicroseconds m_usecPermissionRefreshAfter = 0;
+
         /// Send a packet through this interface to the destination remote address.
         /// If relay address is non-zero, send via Send Indication to the TURN server
         bool SendPacketGather( int nChunks, const iovec *pChunks, int cbPayload, const netadr_t &addrPeer, const netadr_t &addrRelay );

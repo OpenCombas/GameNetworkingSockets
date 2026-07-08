@@ -12,6 +12,67 @@
 #include "crypto.h"
 #include "steamnetworkingsockets_mock.h"
 
+#include <cstring>
+#include <mutex>
+#include <vector>
+
+// [xenia] Optional local-interface allowlist for ICE host-candidate gathering.
+// When non-empty, CSteamNetworkingICESession::GatherInterfaces() only binds
+// addresses in this set as host candidates -- lets the app restrict P2P to a
+// chosen NIC so VPN/virtual adapters with no public route don't get a socket
+// (and then spam STUN with WSAENETUNREACH). Empty = unrestricted (default).
+namespace {
+std::mutex g_xeniaAllowMutex;
+std::vector<SteamNetworkingIPAddr> g_xeniaAllowedLocalAddrs;
+// When false, no IPv6 local interface is bound at all. The allowlist above is
+// per-family-permissive (an IPv4-only list leaves IPv6 unconstrained), so it
+// can't express "no IPv6" on a host that actually has IPv6 addresses -- this
+// flag does. The app sets it from the gns_ice_ipv6 cvar; default true keeps the
+// library unrestricted (matching the empty-allowlist default) until told
+// otherwise, so no other consumer silently loses IPv6.
+bool g_xeniaAllowIPv6 = true;
+
+bool XeniaLocalAddrAllowed( const SteamNetworkingIPAddr &addr )
+{
+	std::lock_guard<std::mutex> lk( g_xeniaAllowMutex );
+	// Hard IPv6 kill-switch, independent of the allowlist. Without this an IPv6
+	// local address slips through whenever the allowlist holds only IPv4 entries.
+	if ( !addr.IsIPv4() && !g_xeniaAllowIPv6 )
+		return false;
+	if ( g_xeniaAllowedLocalAddrs.empty() )
+		return true;  // no restriction configured
+	const bool bIsV4 = addr.IsIPv4();
+	bool bAnySameFamily = false;
+	for ( const SteamNetworkingIPAddr &a : g_xeniaAllowedLocalAddrs )
+	{
+		// Filter per-family: only constrain the address families we were given,
+		// so passing just an IPv4 adapter address leaves IPv6 untouched.
+		if ( a.IsIPv4() != bIsV4 )
+			continue;
+		bAnySameFamily = true;
+		if ( memcmp( a.m_ipv6, addr.m_ipv6, sizeof( a.m_ipv6 ) ) == 0 )
+			return true;
+	}
+	return !bAnySameFamily;
+}
+}  // namespace
+
+// Set (or clear, with nCount==0) the local-interface allowlist above. Exported
+// with C linkage so the Xenia transport can call it without name mangling.
+extern "C" void Xenia_GNS_SetLocalAddrAllowlist( const SteamNetworkingIPAddr *pAddrs, int nCount )
+{
+	std::lock_guard<std::mutex> lk( g_xeniaAllowMutex );
+	g_xeniaAllowedLocalAddrs.assign( pAddrs, pAddrs + ( nCount > 0 ? nCount : 0 ) );
+}
+
+// Allow (true) or hard-block (false) IPv6 local interfaces for ICE gathering,
+// independent of the allowlist. Exported with C linkage for the Xenia transport.
+extern "C" void Xenia_GNS_SetIPv6Allowed( bool bAllowed )
+{
+	std::lock_guard<std::mutex> lk( g_xeniaAllowMutex );
+	g_xeniaAllowIPv6 = bAllowed;
+}
+
 // Put everything in a namespace, so we don't violate the one definition rule
 namespace SteamNetworkingSocketsLib {
 
@@ -957,6 +1018,21 @@ void CSteamNetworkingSocketsSTUNRequest::Think( SteamNetworkingMicroseconds usec
 
         // Immediate failure to send is actually very common, e.g. unroutable between two different private subnets.
         m_usecLastSentTime = 0;
+
+        // Xenia: do NOT fall through to the failure callback + self-destruct on an
+        // *immediate* send failure. On a persistently unroutable local candidate
+        // (e.g. an ISP-assigned global IPv6 with no route, or a VPN/overlay
+        // adapter), the gathering callback re-Queue()s a fresh request that
+        // SetNextThinkTimeASAP()s, so it recreates-and-fails in a tight loop --
+        // melting the service thread ("Processed thinkers 10001 times", lock held
+        // for tens of ms) and starving ICE gathering so no candidate is ever
+        // signaled and the connection never completes. Instead, back off on the
+        // normal retry interval like any un-acked send. m_nRetryCount is already
+        // incremented, so after m_nMaxRetries we still fall through to the
+        // graceful timeout/callback below exactly once, letting gathering finish
+        // on the host + relay candidates.
+        SetNextThinkTime( usecNow + usecInterval );
+        return;
     }
     else
     {
@@ -1519,8 +1595,24 @@ void CSteamNetworkingICESession::GatherInterfaces()
         // Mirrors the early-out in CalcICECandidateType: reject localhost and,
         // in mock-network mode, any address that isn't a recognised mock address.
         int nClassify = ClassifyIP( addr.m_addr ) & ~k_nIPClassify_Mock;
+        // [xenia-diag] Surface every local interface ICE gathers as a host
+        // candidate. Adapters with no public route (e.g. VPN RFC1918 NICs) get a
+        // socket here and then make STUN WSASendTo fail with WSAENETUNREACH --
+        // this log shows exactly which local addrs are in play so adapter
+        // selection can be scoped against real data.
+        SpewMsg( "ICE: gather local addr %s (classify=0x%x)\n",
+                 SteamNetworkingIPAddrRender( addr.m_addr ).c_str(), nClassify );
         if ( nClassify == 0 || ( nClassify & k_nIPClassify_Localhost ) )
             continue;
+
+        // [xenia] Restrict host candidates to the app-selected network adapter
+        // (if any). Skips VPN/virtual NICs that would otherwise bind a socket
+        // and spam STUN with WSAENETUNREACH.
+        if ( !XeniaLocalAddrAllowed( addr.m_addr ) )
+        {
+            SpewMsg( "ICE: skip local addr %s (not the selected adapter)\n", SteamNetworkingIPAddrRender( addr.m_addr ).c_str() );
+            continue;
+        }
 
         std::unique_ptr<ICESessionInterface> pIntf( new ICESessionInterface( *this, uNextPriority, addr.m_nPrefixLen ) );
         SteamDatagramErrMsg errMsg;
@@ -1539,6 +1631,10 @@ void CSteamNetworkingICESession::GatherInterfaces()
 
         ICESessionInterface *pNewIntf = m_vecInterfaces.back().get();
         pNewIntf->NotifyLocalCandidateDiscovered( ICECandidateKind::Host, pNewIntf->m_boundAddr );
+        // [xenia-diag] Confirm which interfaces actually became bound host
+        // candidates (the set STUN/relay/connectivity checks will run from).
+        SpewMsg( "ICE: bound host candidate on %s\n",
+                 CUtlNetAdrRender( pNewIntf->m_boundAddr ).String() );
         m_bCandidatePairsNeedUpdate = true;
     }
 }
@@ -2101,8 +2197,14 @@ void CSteamNetworkingICESession::STUNRequestCallback_RefreshAllocation( const Re
     pIntf->m_addrTURNServer.Clear();   // clears "discovery done" signal; re-allocation starts next tick
     pIntf->m_usecRefreshAfter  = 0;
     pIntf->m_nTURNPermissionRevision = 0;
+    pIntf->m_usecPermissionRefreshAfter = 0;
     // Leave m_bRelayFailed = false so Think_DiscoverRelayCandidate retries.
 }
+
+// How long after a successful CreatePermission to send the next keepalive.  TURN
+// permissions have a fixed 300s lifetime (RFC 5766 section 8); refresh well before
+// that to absorb the 50ms think granularity, STUN retransmits, and round-trip time.
+static const SteamNetworkingMicroseconds k_usecTURNPermissionRefreshInterval = 240 * k_nMillion;
 
 void CSteamNetworkingICESession::Think_TURNMaintenance( SteamNetworkingMicroseconds usecNow )
 {
@@ -2126,7 +2228,14 @@ void CSteamNetworkingICESession::Think_TURNMaintenance( SteamNetworkingMicroseco
         const std_vector<CIPAddress> &vecPermitted = bIsIPv4 ? m_vecTURNPermittedIPv4 : m_vecTURNPermittedIPv6;
         int nSessionRevision = bIsIPv4 ? m_nTURNPermissionRevisionIPv4 : m_nTURNPermissionRevisionIPv6;
 
-        if ( pIntf->m_nTURNPermissionRevision >= nSessionRevision || vecPermitted.empty() )
+        // Send a CreatePermission sweep when either (a) a new peer IP has bumped the
+        // session revision, or (b) our existing permissions are approaching their 300s
+        // expiry and need a keepalive.  The sweep below re-permits the ENTIRE vecPermitted
+        // set, so a single request refreshes every peer's permission at once.
+        bool bNewPeers = pIntf->m_nTURNPermissionRevision < nSessionRevision;
+        bool bPermissionsExpiring =
+            pIntf->m_usecPermissionRefreshAfter != 0 && usecNow >= pIntf->m_usecPermissionRefreshAfter;
+        if ( ( !bNewPeers && !bPermissionsExpiring ) || vecPermitted.empty() )
             continue;
 
         // Build one XOR-PEER-ADDRESS attribute per permitted IP.
@@ -2234,6 +2343,9 @@ void CSteamNetworkingICESession::STUNRequestCallback_CreatePermission( const Rec
     // If more IPs arrived while the request was in flight, the revision will still be
     // behind the session's current revision, and we'll send another CreatePermission.
     pIntf->m_nTURNPermissionRevision = info.m_pRequest->m_nTURNPermissionRevision;
+
+    // Permissions are now good for another 300s; schedule the next keepalive before then.
+    pIntf->m_usecPermissionRefreshAfter = info.m_usecNow + k_usecTURNPermissionRefreshInterval;
 }
 
 void CSteamNetworkingICESession::STUNRequestCallback_ServerReflexiveCandidate( const RecvSTUNPktInfo_t &info )
